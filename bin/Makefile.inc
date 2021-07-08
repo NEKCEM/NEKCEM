@@ -8,6 +8,8 @@
 ?JLBASE?
 ?APP?
 ?USR?
+?USR_LFLAGS?
+?USR_IFLAGS?
 
 BINNAME=nekcem
 APPSRC = $(shell find $(NEKBASE) -name cem_$(APP)*.F)
@@ -30,21 +32,21 @@ poly.c lob_bnd.c findpts_el_3.c findpts_el_2.c sparse_cholesky.c	\
 xxt.c fcrs.c sort.c
 JLSRC = $(patsubst %, $(JLBASE)/%, $(JLFILES))
 JLOBJ = $(patsubst $(JLBASE)/%.c, obj/%.o, $(JLSRC))
-USROBJ = obj/subuser.o
-
+CASENAME = $(basename $(USR))
+USROBJ = obj/${CASENAME}.o
 
 obj/%.o: $(NEKBASE)/%.F SIZE
 	$(FC) -c $(FFLAGS) $< -o $@
 
 obj/%.o: $(NEKBASE)/%.c
-	$(CC) -c $(CFLAGS) $< -o $@
+	$(CC) -c $(CFLAGS) $(USR_IFLAGS) $< -o $@
 
 obj/%.o: $(JLBASE)/%.c
 	$(CC) -c $(CFLAGS) $< -o $@
 
 all: usr jl $(APPOBJ) $(FOBJ) $(COBJ) $(COMMOBJ)
 	$(LD) -o nekcem $(APPOBJ) $(FOBJ) $(COBJ) $(JLOBJ) $(USROBJ) \
-			$(COMMOBJ) $(LDFLAGS)
+			$(COMMOBJ) $(LDFLAGS) $(USR_LFLAGS)
 	@if test -f ${BINNAME}; then \
         echo ""; \
         echo "$(NEK_WARN)"; \
@@ -59,10 +61,11 @@ all: usr jl $(APPOBJ) $(FOBJ) $(COBJ) $(COMMOBJ)
 	echo -e "\033[0m"; \
 	fi
 
-usr: dir $(USR)
-	cp $(USR) obj/subuser.F
-	$(FC) -c obj/subuser.F -o $(USROBJ) $(FFLAGS) -I$(NEKBASE)
-	rm obj/subuser.F
+usr: ${USROBJ}
+
+${USROBJ}: ./SIZE ${USR}
+	@env CASENAME=$(CASENAME) $(NEKBASE)/mkuserfile
+	$(FC) -c ${CASENAME}.F -o $(USROBJ) $(FFLAGS) -I$(NEKBASE)
 
 jl: dir $(JLOBJ)
 

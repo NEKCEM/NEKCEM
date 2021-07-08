@@ -1,0 +1,429 @@
+c-----------------------------------------------------------------------
+      subroutine read_re2_data(ifbswap, ifxyz, ifcur, ifbc)  ! .re2 reader
+
+      include 'SIZE'
+      include 'TOTAL'
+      include 'RESTART'
+      include 'CTIMER'
+
+      logical ifbswap
+      logical ifxyz, ifcur, ifbc
+      integer idummy(100)
+      integer re2_h
+
+      common /nekmpi/ nidd,npp,nekcomm,nekgroup,nekreal
+ 
+      etime0 = dnekclock_sync()
+
+      ibc   = 1
+      nfldt = nfield
+
+      ! first field to read
+      if (param(33).gt.0) ibc = int(param(33))
+
+      ! number of fields to read
+      if (param(32).gt.0) then
+        nfldt = ibc + int(param(32)) - 1
+        nfldt = max(nfldt,1) 
+        if (nelgt.gt.nelgv) nfldt = max(nfldt,2) 
+      endif
+
+      call blank(cbc,3*size(cbc))
+      call rzero(bc ,size(bc))
+
+      call byte_close(re2fle,ierr)
+      call crystal_setup(cr_re2,nekcomm,np)
+      call nek_file_open(nekcomm,re2fle,0,0,param(61),re2_h,ierr)
+      call err_chk(ierr,' Cannot open .re2 file!$')
+      call readp_re2_mesh (re2_h,ifbswap,ifxyz)
+      call readp_re2_curve(re2_h,ifbswap,ifcur)
+      do ifield = ibc,nfldt
+      call readp_re2_bc(cbc(1,1,ifield),bc(1,1,1,ifield),re2_h,
+     &                  ifbswap,ifbc)
+      if (nek_file_eof(re2_h,ierr).gt.0) goto 80
+      if (ierr.gt.0)  goto 100
+      enddo
+  80  call nek_file_close(re2_h,ierr)
+      call crystal_free(cr_re2)
+
+      etime_t = dnekclock_sync() - etime0
+      if(nio.eq.0) write(6,'(A,1(1g9.2),A,/)')
+     &                   ' done :: read .re2 file   ',
+     &                   etime_t, ' sec'
+
+ 100  call err_chk(ierr,'Error nek_file_eof')
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine readp_re2_mesh(re2_h,ifbswap,ifread)
+
+      include 'SIZE'
+      include 'TOTAL'
+
+      logical ifbswap
+      logical ifread
+
+      parameter(nrmax = lelt)             ! maximum number of records
+      parameter(lrs   = 1+ldim*(2**ldim)) ! record size: group x(:,c) ...
+      parameter(li    = 2*lrs+2)
+
+      integer         bufr(li-2,nrmax)
+      common /scrns/  bufr
+
+      integer         vi  (li  ,nrmax)
+      common /ctmp1/  vi
+
+      integer*8       lre2off_b,dtmp8
+      integer*8       nrg
+      integer*8       count_b
+
+      nrg       = nelgt
+      nr        = nelt
+      irankoff  = igl_running_sum(nr) - nr
+      dtmp8     = irankoff
+      re2off_b  = 84 ! set initial offset (hdr + endian)
+      lre2off_b = re2off_b + dtmp8*lrs*wdsizi
+      lrs4      = lrs*wdsizi/4
+
+      ! read coordinates from file
+      nwds4r = nr*lrs4
+      count_b = int(nwds4r,8)*4
+      call nek_file_read(re2_h,count_b,lre2off_b,bufr,ierr)
+      re2off_b = re2off_b + nrg*4*lrs4
+      if (ierr.gt.0) goto 100
+
+      if (.not.ifread) return
+
+      if (nio.eq.0) write(6,*) 'reading mesh '
+
+      ! pack buffer
+      do i = 1,nr
+         jj      = (i-1)*lrs4 + 1
+         ielg    = irankoff + i ! elements are stored in global order
+         vi(1,i) = gllnid(ielg)
+         vi(2,i) = ielg
+         call icopy(vi(3,i),bufr(jj,1),lrs4)
+      enddo
+
+      ! crystal route nr real items of size lrs to rank vi(key,1:nr)
+      n   = nr
+      key = 1 
+      call crystal_tuple_transfer(cr_re2,n,nrmax,vi,li,
+     &   vl,0,vr,0,key)
+
+      ! unpack buffer
+      ierr = 0
+      if (n.gt.nrmax) then
+         ierr = 1
+         goto 100
+      endif
+
+      do i = 1,n
+         iel = gllel(vi(2,i)) 
+         call icopy     (bufr,vi(3,i),lrs4)
+         call buf_to_xyz(bufr,iel,ifbswap,ierr)
+      enddo
+
+ 100  call err_chk(ierr,'Error reading .re2 mesh$')
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine readp_re2_curve(re2_h,ifbswap,ifread)
+
+      include 'SIZE'
+      include 'TOTAL'
+
+      logical ifbswap
+      logical ifread
+
+      common /nekmpi/ nidd,npp,nekcomm,nekgroup,nekreal
+
+      parameter(nrmax = 12*lelt) ! maximum number of records
+      parameter(lrs   = 2+1+5)   ! record size: eg iside curve(5) ccurve
+      parameter(li    = 2*lrs+1)
+
+      integer         bufr(li-1,nrmax)
+      common /scrns/  bufr
+
+      integer         vi  (li  ,nrmax)
+      common /ctmp1/  vi
+
+      integer*8       lre2off_b,dtmp8
+      integer*8       nrg
+      integer*4       nrg4(2)
+     
+      integer*8       i8gl_running_sum 
+      integer*8       count_b
+
+      ! read total number of records
+      nwds4r    = 1*wdsizi/4
+      lre2off_b = re2off_b
+      ierr = 0
+      count_b = int(nwds4r,8)*4
+      if (nid.ne.0) count_b = 0
+      call nek_file_read(re2_h,count_b,lre2off_b,nrg4,ierr)
+      if(ierr.gt.0) goto 100
+
+      if(wdsizi.eq.8) then
+         if(ifbswap) call byte_reverse8(nrg4,nwds4r,ierr)
+         call copy(dnrg,nrg4,1)
+         nrg = dnrg
+      else
+         if(ifbswap) call byte_reverse (nrg4,nwds4r,ierr)
+         nrg = nrg4(1)
+      endif
+      re2off_b = re2off_b + 4*nwds4r
+
+      if(nrg.eq.0) return
+
+      ! read data from file
+      dtmp8 = np
+      nr = nrg/dtmp8
+      do i = 0,mod(nrg,dtmp8)-1
+         if(i.eq.nid) nr = nr + 1
+      enddo
+      dtmp8     = i8gl_running_sum(int(nr,8)) - nr
+      lre2off_b = re2off_b + dtmp8*lrs*wdsizi
+      lrs4      = lrs*wdsizi/4
+
+      re2off_b = re2off_b + nrg*4*lrs4
+
+      if (.not.ifread) return
+      if(nio.eq.0) write(6,*) 'reading curved sides '
+
+      nwds4r = nr*lrs4
+      count_b = int(nwds4r,8)*4
+      call nek_file_read(re2_h,count_b,lre2off_b,bufr,ierr)
+      if(ierr.gt.0) goto 100
+
+      ! pack buffer
+      do i = 1,nr
+         jj = (i-1)*lrs4 + 1
+
+         if(ifbswap) then 
+           lrs4s = lrs4 - wdsizi/4 ! words to swap (last is char)
+           if(wdsizi.eq.8) call byte_reverse8(bufr(jj,1),lrs4s,ierr)
+           if(wdsizi.eq.4) call byte_reverse (bufr(jj,1),lrs4s,ierr)
+         endif
+
+         ielg = bufr(jj,1)
+         if(wdsizi.eq.8) call copyi4(ielg,bufr(jj,1),1)
+
+         if(ielg.le.0 .or. ielg.gt.nelgt) goto 100
+         vi(1,i) = gllnid(ielg)
+
+         call icopy (vi(2,i),bufr(jj,1),lrs4)
+      enddo
+
+      ! crystal route nr real items of size lrs to rank vi(key,1:nr)
+      n    = nr
+      key  = 1
+      call crystal_tuple_transfer(cr_re2,n,nrmax,vi,li,vl,0,vr,0,
+     &                                   key)
+
+      ! unpack buffer
+      if(n.gt.nrmax) goto 100
+      do i = 1,n
+         call icopy       (bufr,vi(2,i),lrs4)
+         call buf_to_curve(bufr)
+      enddo
+
+      return
+
+ 100  ierr = 1
+      call err_chk(ierr,'Error reading .re2 curved data$')
+
+      end
+c-----------------------------------------------------------------------
+      subroutine readp_re2_bc(cbl,bl,re2_h,ifbswap,ifread)
+
+      include 'SIZE'
+      include 'TOTAL'
+
+      character*3  cbl(  6,lelt)
+      real         bl (5,6,lelt)
+      logical      ifbswap
+      logical      ifread
+
+      parameter(nrmax = 6*lelt) ! maximum number of records
+      parameter(lrs   = 2+1+5)  ! record size: eg iside bl(5) cbl
+      parameter(li    = 2*lrs+1)
+
+      integer         bufr(li-1,nrmax)
+      common /scrns/  bufr
+
+      integer         vi  (li  ,nrmax)
+      common /ctmp1/  vi
+
+      integer*8       lre2off_b,dtmp8,nbcs
+      integer*8       nrg
+      integer*4       nrg4(2)
+      integer*8       count_b
+
+      integer*8       i8gl_running_sum 
+
+      ! read total number of records
+      nwds4r    = 1*wdsizi/4
+      lre2off_b = re2off_b
+      ierr = 0
+      count_b = int(nwds4r,8)*4
+      if (nid.ne.0) count_b = 0
+      call nek_file_read(re2_h,count_b,lre2off_b,nrg4,ierr)
+      call bcast(nrg4,wdsizi)
+      if(ierr.gt.0) goto 100
+
+      if(wdsizi.eq.8) then
+         if(ifbswap) call byte_reverse8(nrg4,nwds4r,ierr)
+         call copy(dnrg,nrg4,1)
+         nrg = dnrg
+      else
+         if(ifbswap) call byte_reverse (nrg4,nwds4r,ierr)
+         nrg = nrg4(1)
+      endif
+      re2off_b = re2off_b + 4*nwds4r
+
+      if(nrg.eq.0) return
+
+      ! read data from file
+      dtmp8 = np
+      nr = nrg/dtmp8
+      do i = 0,mod(nrg,dtmp8)-1
+         if(i.eq.nid) nr = nr + 1
+      enddo
+      dtmp8     = i8gl_running_sum(int(nr,8)) - nr
+      lre2off_b = re2off_b + dtmp8*lrs*wdsizi
+      lrs4      = lrs*wdsizi/4
+
+      re2off_b = re2off_b + nrg*4*lrs4
+
+      if (.not.ifread) return
+      if(nio.eq.0) write(6,*) 'reading bc for ifld',ifield
+
+      nwds4r = nr*lrs4
+      count_b = int(nwds4r,8)*4
+      call nek_file_read(re2_h,count_b,lre2off_b,bufr,ierr)
+      if(ierr.gt.0) goto 100
+
+      ! pack buffer
+      do i = 1,nr
+         jj = (i-1)*lrs4 + 1
+
+         if(ifbswap) then 
+           lrs4s = lrs4 - wdsizi/4 ! words to swap (last is char)
+           if(wdsizi.eq.8) call byte_reverse8(bufr(jj,1),lrs4s,ierr)
+           if(wdsizi.eq.4) call byte_reverse (bufr(jj,1),lrs4s,ierr)
+         endif
+
+         ielg = bufr(jj,1)
+         if(wdsizi.eq.8) call copyi4(ielg,bufr(jj,1),1)
+
+         if(ielg.le.0 .or. ielg.gt.nelgt) goto 100
+         vi(1,i) = gllnid(ielg)
+
+         call icopy (vi(2,i),bufr(jj,1),lrs4)
+      enddo
+
+      ! crystal route nr real items of size lrs to rank vi(key,1:nr)
+      n    = nr
+      key  = 1
+
+      call crystal_tuple_transfer(cr_re2,n,nrmax,vi,li,vl,0,vr,0,
+     &                                   key)
+
+      nbcs = n
+      nbcs = i8glsum(nbcs,1)
+      if(nio.eq.0) write(6,*) nbcs,' boundary conditions read from .re2'
+
+      ! fill up with default
+      do iel=1,nelt
+      do k=1,6
+         cbl(k,iel) = 'E  '
+      enddo
+      enddo
+
+      ! unpack buffer
+      if(n.gt.nrmax) goto 100
+      do i = 1,n
+         call icopy    (bufr,vi(2,i),lrs4)
+         call buf_to_bc(cbl,bl,bufr)
+      enddo
+
+      return
+
+ 100  ierr = 1
+      call err_chk(ierr,'Error reading .re2 boundary data$')
+
+      end
+c-----------------------------------------------------------------------
+      subroutine read_re2_hdr(ifbswap, ifverbose) ! open file & chk for byteswap
+
+      include 'SIZE'
+      include 'TOTAL'
+
+      logical ifbswap, ifverbose
+      logical if_byte_swap_test
+
+      integer fnami (33)
+      character*132 fname
+      equivalence (fname,fnami)
+
+      character*132 hdr
+      character*5 version
+      real*4      test
+
+      logical iffound
+
+      ierr=0
+
+      if (nid.eq.0) then
+         if (ifverbose) write(6,'(A,A)') ' Reading ', re2fle
+         call izero(fnami,33)
+         m = indx2(re2fle,132,' ',1)-1
+         call chcopy(fname,re2fle,m)
+
+         inquire(file=fname, exist=iffound)
+         if(.not.iffound) ierr = 1
+      endif
+      call err_chk(ierr,' Cannot find re2 file!$')
+
+      if (nid.eq.0) then
+         call byte_close(ierr)
+         call byte_open(fname,ierr)
+         if(ierr.ne.0) goto 100
+         call byte_read(hdr,20,ierr)
+         if(ierr.ne.0) goto 100
+         
+         read (hdr,1) version,nelgt,ldimr,nelgv
+    1    format(a5,i9,i3,i9)
+ 
+         wdsizi = 4
+         if(version.eq.'#v002') wdsizi = 8
+         if(version.eq.'#v003') then
+           wdsizi = 8
+           param(32)=1
+         endif
+
+         call byte_read(test,1,ierr)
+         if(ierr.ne.0) goto 100
+         ifbswap = if_byte_swap_test(test,ierr)
+         if(ierr.ne.0) goto 100
+        
+         call byte_close(ierr)
+      endif
+ 
+ 100  call err_chk(ierr,'Error reading re2 header$')
+
+      call bcast(wdsizi, ISIZE)
+      call bcast(ifbswap,LSIZE)
+      call bcast(nelgv  ,ISIZE)
+      call bcast(nelgt  ,ISIZE)
+      call bcast(ldimr  ,ISIZE)
+      call bcast(param(32),WDSIZE)
+
+      if(wdsize.eq.4.and.wdsizi.eq.8) 
+     $   call exitti('wdsize=4 & wdsizi(re2)=8 not compatible$',wdsizi)
+
+      return
+      end

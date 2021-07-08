@@ -73,19 +73,28 @@ C     INPUT4:  CHARACTER       INPUT8: CHARACTER with LELT entries
      $               ,CPGRP(-5:10,LDIMT1,3)
      $               ,QINTEG(LDIMT3,MAXOBJ)
       real  param,rstim,vnekton,cpfld,cpgrp,qinteg
+     $     ,uparam(20)
+     $     ,restol(0:LDIMT1)
+     $     ,atol(0:LDIMT1)
+     $     ,fem_amg_param(15)
+     $     ,crs_param(15)
+     $     ,filterType
 
       COMMON /INPUT2/ MATYPE(-5:10,LDIMT1)
      $               ,NKTONV,NHIS,LOCHIS(4,lhis)
      $               ,IPSCAL,NPSCAL,IPSCO, ifldmhd
      $               ,IRSTV,IRSTT,IRSTIM,NMEMBER(MAXOBJ),NOBJ
-     $               ,NGEOM
+     $               ,IDPSS,NGEOM,meshPartitioner
       integer matype,nktonv,nhis,lochis,ipscal,npscal,ipsco,ifldmhd
-      integer irstv,irstt,irstim,nmember,nobj,ngeom
+      integer irstv,irstt,irstim,nmember,nobj,ngeom,idpss(ldimt)
+      integer meshPartitioner
 
       COMMON /INPUT3/ IF3D
      $               ,IFDG,IFSE,IFHEX,IFTET
+     $               ,IFDGFLD,IFDIFF,IFDEAL
      $               ,IFFLOW,IFHEAT,IFTRAN,IFAXIS,IFSTRS,IFSPLIT
-     $               ,IFMGRID,IFADVC(LDIMT1),IFTMSH(0:LDIMT1)
+     $               ,IFMGRID,IFADVC(LDIMT1)
+     $               ,IFTMSH(0:LDIMT1)
      $               ,IFMVBD,IFCHAR,IFNONL(LDIMT1)
      $               ,IFVARP(LDIMT1),IFPSCO(LDIMT1),IFVPS
      $               ,IFMODEL,IFKEPS
@@ -95,9 +104,12 @@ C     INPUT4:  CHARACTER       INPUT8: CHARACTER with LELT entries
      $               ,IFANLS,IFANL2,IFMHD,IFESSR,IFPERT,IFBASE
      $               ,IFCVODE,IFLOMACH,IFEXPLVIS,IFSCHCLOB,IFUSERVP 
      $               ,IFCYCLIC,IFCOUP, IFVCOUP, IFUSERMV,IFREGUO 
+     $               ,IFCVFLD,IFDP0DT
      $               ,ifxyo_,ifaziv,ifneknek,ifneknekm,ifneknekc
+     $               ,ifmpiio,ifrich,ifvvisp
       LOGICAL         IF3D
      $               ,IFDG,IFSE,IFHEX,IFTET
+     $               ,IFDGFLD(0:LDIMT1),IFDIFF(LDIMT1),IFDEAL(LDIMT1)
      $               ,IFFLOW,IFHEAT,IFTRAN,IFAXIS,IFSTRS,IFSPLIT
      $               ,IFMGRID,IFADVC,IFTMSH
      $               ,IFMVBD,IFCHAR,IFNONL
@@ -109,7 +121,9 @@ C     INPUT4:  CHARACTER       INPUT8: CHARACTER with LELT entries
      $               ,IFANLS,IFANL2,IFMHD,IFESSR,IFPERT,IFBASE
      $               ,IFCVODE,IFLOMACH,IFEXPLVIS,IFSCHCLOB,IFUSERVP
      $               ,IFCYCLIC,IFCOUP, IFVCOUP, IFUSERMV,IFREGUO 
+     $               ,IFCVFLD(LDIMT1),IFDP0DT
      $               ,ifxyo_,ifaziv,ifneknek,ifneknekm,ifneknekc
+     $               ,ifmpiio,ifrich,ifvvisp
       LOGICAL         IFNAV        
       EQUIVALENCE    (IFNAV, IFADVC(1))
 
@@ -130,8 +144,14 @@ c     CHARACTER(len=132) REAFLE,SESSION,RE2FLE,H5MFLE
       character*132   reafle,fldfle,dmpfle,hisfle,schfle,orefle,nrefle
       common /cfiles/ reafle,fldfle,dmpfle,hisfle,schfle,orefle,nrefle
 
-      character*132   session,path,re2fle,parfle
-      common /cfile2/ session,path,re2fle,parfle
+      character*132   session,path,re2fle,parfle,ma2fle,co2fle,mapfle
+      common /cfile2/ session,path,re2fle,parfle,ma2fle,co2fle,mapfle
+
+      integer cr_re2,fh_re2
+      common /handles_re2/ cr_re2,fh_re2
+
+      integer*8 re2off_b
+      common /off_re2/ re2off_b
 
 C proportional to LELT
 

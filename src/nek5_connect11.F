@@ -1,3 +1,4 @@
+c--------------------------------------------------------
       subroutine setup_topo
 c
 c     Parallel compatible routine to find
@@ -33,7 +34,7 @@ c
       common /ivrtx/ vertex ((2**ldim)*lelt)
       integer        vertex
 
-      if (nid_io.eq.0) write(6,*) 'setup mesh topology'
+      if (nid_io.eq.0) write(6,*) 'setup_topo NekCEM legacy (.map/.ma2)'
 c
 c     Initialize key arrays for Direct Stiffness SUM.
 c
@@ -130,9 +131,13 @@ c       check if there is a least one fluid element on each processor
       call rone    (tmult,ntott)
       call dssum   (tmult,nx1,ny1,nz1)
       call invcol1 (tmult,ntott)
-
+      
+      if (nid_io.eq.0) write(6,*) 'Finish setup_topo NekCEM legacy'
+      
       return
       end
+
+
 c-----------------------------------------------------------------------
       subroutine setup_ds(gs_handle,nx,ny,nz,nel,melg,vertex,glo_num)
       include 'SIZE'
@@ -205,9 +210,17 @@ c
       logical ifcenter
 
       if (ldim.eq.3) then
+#if !defined(PARRSB) && !defined(PARMETIS)
+         call setvert3d_legacy(glo_num,ngv,nx,nel,vertex,ifcenter)
+#else
          call setvert3d(glo_num,ngv,nx,nel,vertex,ifcenter)
+#endif
       else
+#if !defined(PARRSB) && !defined(PARMETIS)
+         call setvert2d_legacy(glo_num,ngv,nx,nel,vertex,ifcenter)
+#else
          call setvert2d(glo_num,ngv,nx,nel,vertex,ifcenter)
+#endif
       endif
 
       if (nid_io.eq.0) write(6,*) '  call usrsetvert'
@@ -282,8 +295,443 @@ C     enddo
 
       return
       end
+
+c-----------------------------------------------------------------------
+      subroutine gbtuple_rank8(tuple,m,n,nmax,cr_h,nid,np,ind)
+c
+c     Return a unique rank for each matched tuple set. Global.  Balanced.
+c
+c     tuple is destroyed.
+c
+c     By "balanced" we mean that none of the tuple entries is likely to
+c     be much more uniquely populated than any other, so that any of
+c     the tuples can serve as an initial (parallel) sort key
+c
+c     First two slots in tuple(:,i) assumed empty
+c
+      integer*8 tuple(m,nmax)
+      integer ind(nmax),cr_h
+
+      parameter (mmax=40)
+      integer key(mmax)
+      integer*8  wtuple(mmax),np8
+
+      integer*8 nu8,nu_prior,nu_tot,i8gl_running_sum
+
+
+      np8 = np
+
+      if (m.gt.mmax) then
+         write(6,*) nid,m,mmax,' gbtuple_rank8 fail, B'
+         call exitt
+      endif
+
+      do i=1,n
+         tuple(1,i) = mod(tuple(3,i),np8) ! destination processor
+         tuple(2,i) = i                   ! return location
+      enddo
+
+      ni= n
+      ky=1  ! Assumes crystal_new already called
+      call crystal_ituple_transfer(cr_h, tuple,2*m,ni,nmax, ky)
+
+
+      nimx = iglmax(ni,1)
+      if (ni.gt.nmax)   write(6,*) ni,nmax,n,'cr_xfer problem, B'
+      if (nimx.gt.nmax) call exitt
+
+      nkey = m-2
+      do k=1,nkey
+         key(k) = k+2
+      enddo
+
+
+      call i8rank_vecn(ind,nu,tuple,m,ni,key,nkey,wtuple)! tuple re-ordered,
+                                                         ! but contents same
+      nu8      = nu
+      nu_tot   = i8gl_running_sum(nu8) ! running sum over P processors
+      nu_prior = nu_tot - nu8
+
+      do i=1,ni
+         tuple(3,i) = ind(i) + nu_prior  ! global ranking
+      enddo
+
+c     Use 2*m since tuple = int*8
+      call crystal_ituple_transfer(cr_h, tuple,2*m,ni,nmax, ky)
+
+      nk = 1  ! restore to original order, local rank: 2; global: 3
+      ky = 2
+      call i8tuple_sort(tuple,m,n,ky,nk,ind,wtuple)
+
+
+      return
+      end
+c-----------------------------------------------------------------------
+
+
 c-----------------------------------------------------------------------
       subroutine setvert3d(glo_num,ngv,nx,nel,vertex,ifcenter)
+c
+c     setup unique ids for dssum  
+c     note:
+c     total number of unique vertices, edges and faces has to be smaller 
+c     than 2**31 (integer-4 limit).
+c     if nelgt < 2**31/12 we're ok for sure (independent of N)! 
+c
+      include 'SIZE'
+      include 'CTIMER'
+      include 'PARALLEL'
+      include 'TOPOL'
+      include 'GEOM'
+
+      integer*8 glo_num(1)
+      integer*8 ngv
+      integer*8 vertex(0:1,0:1,0:1,1)
+      logical ifcenter
+
+      integer*8 edge(0:1,0:1,0:1,3,lelt),enum(12,lelt),fnum(6,lelt)
+      common  /scrmg/ edge,enum,fnum
+
+      parameter (nsafe=8)  ! OFTEN, nsafe=2 suffices
+      integer*8 etuple(4,12*lelt*nsafe),ftuple(5,6,lelt*nsafe)
+      integer ind(12*lelt*nsafe)
+      common  /scrns/ etuple,ind
+      equivalence  (etuple,ftuple)
+
+      logical ifij
+
+      integer e,eg
+      integer*8 gvf(4),facet(4)
+      
+      integer*8 ngvv,ngve,ngvs,ngvi,ngvm,igv,ig0
+      integer*8 n_on_edge,n_on_face,n_in_interior,n_unique_edges
+      integer*8 i8glmax,kswap
+
+      ny   = nx
+      nz   = nx
+      nxyz = nx*ny*nz
+c
+c     Assign hypercube ordering of vertices
+c     -------------------------------------
+c
+c     Count number of unique vertices
+      nlv  = 2**ldim
+      ngvv = i8glmax(vertex,nlv*nel)
+c
+      do e=1,nel    !  Local to global node number (vertex)
+         do k=0,1
+         do j=0,1
+         do i=0,1
+            il  = 1 + (nx-1)*i + nx*(nx-1)*j + nx*nx*(nx-1)*k
+            ile = il + nx*ny*nz*(e-1)
+            glo_num(ile)   = vertex(i,j,k,e)
+         enddo
+         enddo
+         enddo
+      enddo
+      ngv  = ngvv
+c
+      if (nx.eq.2) return
+c
+c     Assign global vertex numbers to SEM nodes on each edge
+c     ------------------------------------------------------
+c
+c     Assign edge labels by bounding vertices.  
+      do e=1,nel
+         do k=0,1
+         do j=0,1
+         do i=0,1
+            edge(i,j,k,1,e) = vertex(i,j,k,e)  ! r-edge
+            edge(j,i,k,2,e) = vertex(i,j,k,e)  ! s-edge
+            edge(k,i,j,3,e) = vertex(i,j,k,e)  ! t-edge
+         enddo
+         enddo
+         enddo
+      enddo
+c
+c     Sort edges by bounding vertices.
+      do i=0,12*nel-1
+         if (edge(0,i,0,1,1).gt.edge(1,i,0,1,1)) then
+            kswap = edge(0,i,0,1,1)
+            edge(0,i,0,1,1) = edge(1,i,0,1,1)
+            edge(1,i,0,1,1) = kswap
+         endif
+         etuple(3,i+1) = edge(0,i,0,1,1)
+         etuple(4,i+1) = edge(1,i,0,1,1)
+      enddo
+c
+c     Assign a number (rank) to each unique edge
+      m    = 4
+      n    = 12*nel
+      nmax = 12*lelt*nsafe  ! nsafe for crystal router factor of safety
+      call gbtuple_rank8(etuple,m,n,nmax,cr_h,nid,np,ind)
+      do i=1,12*nel
+         enum(i,1) = etuple(3,i)
+      enddo
+      n_unique_edges = i8glmax(enum,12*nel)
+
+c
+      n_on_edge = nx-2
+      ngve      = n_unique_edges*n_on_edge
+      do e=1,nel
+         iedg_loc = 0
+c
+c        Edges 1-4
+         do k=0,1
+         do j=0,1
+            igv = ngv + n_on_edge*(enum(iedg_loc+1,e)-1)
+            i0  = nx*(nx-1)*j + nx*nx*(nx-1)*k
+            i0e = i0 + nxyz*(e-1)
+            if (glo_num(i0e+1).lt.glo_num(i0e+nx)) then
+               do i=2,nx-1                                   ! std forward case
+                  glo_num(i0e+i) = igv + i-1
+               enddo
+            else
+               do i=2,nx-1                                   ! backward case
+                  glo_num(i0e+i) = igv + 1 + n_on_edge-(i-1)
+               enddo
+            endif
+            iedg_loc = iedg_loc + 1
+         enddo
+         enddo
+c
+c        Edges 5-8
+         do k=0,1
+         do i=0,1
+            igv = ngv + n_on_edge*(enum(iedg_loc+1,e)-1)
+            i0  = 1+(nx-1)*i + nx*nx*(nx-1)*k
+            i0e = i0 + nxyz*(e-1)
+            if (glo_num(i0e).lt.glo_num(i0e+nx*(nx-1))) then
+               do j=2,nx-1                                   ! std forward case
+                  glo_num(i0e+(j-1)*nx) = igv + j-1
+               enddo
+            else
+               do j=2,nx-1                                   ! backward case
+                  glo_num(i0e+(j-1)*nx) = igv + 1 + n_on_edge-(j-1)
+               enddo
+            endif
+            iedg_loc = iedg_loc + 1
+         enddo
+         enddo
+c
+c        Edges 9-12
+         do j=0,1
+         do i=0,1
+            igv = ngv + n_on_edge*(enum(iedg_loc+1,e)-1)
+            i0  = 1 + (nx-1)*i + nx*(nx-1)*j
+            i0e = i0 + nxyz*(e-1)
+            if (glo_num(i0e).lt.glo_num(i0e+nx*nx*(nx-1))) then
+               do k=2,nx-1                                   ! std forward case
+                  glo_num(i0e+(k-1)*nx*nx) = igv + k-1
+               enddo
+            else
+               do k=2,nx-1                                   ! backward case
+                  glo_num(i0e+(k-1)*nx*nx) = igv + 1 + n_on_edge-(k-1)
+               enddo
+            endif
+            iedg_loc = iedg_loc + 1
+         enddo
+         enddo
+      enddo
+      ngv   = ngv + ngve
+c
+c     Asign global node numbers on the interior of each face
+c     ------------------------------------------------------ 
+c
+c     Assign faces by 3-tuples 
+c
+c     (The following variables all take the symmetric 
+c     notation of IFACE as arguments:)
+c
+c     ICFACE(i,IFACE) -   Gives the 4 vertices which reside on face IFACE
+c                         as depicted below, e.g. ICFACE(i,2)=2,4,6,8.
+c
+c                        3+-----+4    ^ Y
+c                        /  2  /|     |
+c     Edge 1 extends    /     / |     |
+c       from vertex   7+-----+8 +2    +----> X
+c       1 to 2.        |  4  | /     /
+c                      |     |/     /
+c                     5+-----+6    Z
+c                         3
+c
+      nfaces=ldim*2
+      ncrnr =2**(ldim-1)
+      do e=1,nel
+         do ifac=1,nfaces
+            do icrn=1,ncrnr
+               i                  = icface(icrn,ifac)-1
+               facet(icrn)        = vertex(i,0,0,e)
+            enddo
+            call i8sort(facet,ind,ncrnr)
+            call i8copy(ftuple(3,ifac,e),facet,ncrnr-1)
+         enddo
+      enddo
+
+c     Assign a number (rank) to each unique face
+      m    = 5
+      n    = 6*nel
+      nmax = 6*lelt*nsafe  ! nsafe for crystal router factor of safety
+      call gbtuple_rank8(ftuple,m,n,nmax,cr_h,nid,np,ind)
+      do i=1,6*nel
+         fnum(i,1) = ftuple(3,i,1)
+      enddo
+      n_unique_faces = i8glmax(fnum,6*nel)
+c
+      call dsset (nx,ny,nz)
+      do e=1,nel
+      do iface=1,nfaces
+         i0 = skpdat(1,iface)
+         i1 = skpdat(2,iface)
+         is = skpdat(3,iface)
+         j0 = skpdat(4,iface)
+         j1 = skpdat(5,iface)
+         js = skpdat(6,iface)
+c
+c        On each face, count from minimum global vertex number,
+c        towards smallest adjacent vertex number.  e.g., suppose
+c        the face is defined by the following global vertex numbers:
+c
+c
+c                    11+--------+81
+c                      |c      d|
+c                      |        |
+c                      |        |
+c                      |a      b|
+c                    15+--------+62
+c                          
+c        We would count from c-->a, then towards d.
+c
+
+         gvf(1) = glo_num(i0+nx*(j0-1)+nxyz*(e-1))
+         gvf(2) = glo_num(i1+nx*(j0-1)+nxyz*(e-1))
+         gvf(3) = glo_num(i0+nx*(j1-1)+nxyz*(e-1))
+         gvf(4) = glo_num(i1+nx*(j1-1)+nxyz*(e-1))
+         call i8rank(gvf,ind,4)
+
+c        ind(1) tells which element of gvf() is smallest.
+
+         ifij = .false.
+         if (ind(1).eq.1) then
+            idir =  1
+            jdir =  1
+            if (gvf(2).lt.gvf(3)) ifij = .true.
+         elseif (ind(1).eq.2) then
+            idir = -1
+            jdir =  1
+            if (gvf(1).lt.gvf(4)) ifij = .true.
+         elseif (ind(1).eq.3) then
+            idir =  1
+            jdir = -1
+            if (gvf(4).lt.gvf(1)) ifij = .true.
+         elseif (ind(1).eq.4) then
+            idir = -1
+            jdir = -1
+            if (gvf(3).lt.gvf(2)) ifij = .true.
+         endif
+c
+         if (idir.lt.0) then
+            it=i0
+            i0=i1
+            i1=it
+            is=-is
+         endif
+c
+         if (jdir.lt.0) then
+            jt=j0
+            j0=j1
+            j1=jt
+            js=-js
+         endif
+
+         nxx = nx*nx
+         n_on_face = (nx-2)*(ny-2)
+         ngvs  = n_unique_faces*n_on_face
+         ig0 = ngv + n_on_face*(fnum(iface,e)-1)
+         if (ifij) then
+            k=0
+            l=0
+            do j=j0,j1,js
+            do i=i0,i1,is
+               k=k+1
+c              this is a serious kludge to stay on the face interior
+               if (k.gt.nx.and.k.lt.nxx-nx .and.
+     $            mod(k,nx).ne.1.and.mod(k,nx).ne.0) then
+c                 interior
+                  l = l+1
+                  glo_num(i+nx*(j-1)+nxyz*(e-1)) = l + ig0
+               endif
+            enddo
+            enddo
+         else
+            k=0
+            l=0
+            do i=i0,i1,is
+            do j=j0,j1,js
+               k=k+1
+c              this is a serious kludge to stay on the face interior
+               if (k.gt.nx.and.k.lt.nxx-nx .and.
+     $            mod(k,nx).ne.1.and.mod(k,nx).ne.0) then
+c                 interior
+                  l = l+1
+                  glo_num(i+nx*(j-1)+nxyz*(e-1)) = l + ig0
+               endif
+            enddo
+            enddo
+         endif
+      enddo
+      enddo
+      ngv   = ngv + ngvs
+
+c     Finally,  number interiors (only ifcenter=.true.)
+c     -------------------------------------------------
+
+      n_in_interior = (nx-2)*(ny-2)*(nz-2)
+      ngvi = n_in_interior*nelgt
+      if (ifcenter) then
+         do e=1,nel
+            ig0 = ngv + n_in_interior*(lglel(e)-1)
+            l = 0
+            do k=2,nz-1
+            do j=2,ny-1
+            do i=2,nx-1
+               l = l+1
+               glo_num(i+nx*(j-1)+nx*ny*(k-1)+nxyz*(e-1)) = ig0+l
+            enddo
+            enddo
+            enddo
+         enddo
+         ngv = ngv + ngvi
+      else
+         do e=1,nel
+            l = 0
+            do k=2,nz-1
+            do j=2,ny-1
+            do i=2,nx-1
+               l = l+1
+               glo_num(i+nx*(j-1)+nx*ny*(k-1)+nxyz*(e-1)) = 0
+            enddo
+            enddo
+            enddo
+         enddo
+      endif
+
+c     Quick check on maximum #dofs:
+      m    = nxyz*nelt
+      ngvm = i8glmax(glo_num,m)
+      ngvv = ngvv + ngve + ngvs  ! number of unique ids w/o interior 
+      ngvi = ngvi + ngvv         ! total number of unique ids 
+      if (nio.eq.0 .and. loglevel.gt.1) 
+     $  write(6,1) nx,ngvv,ngvi,ngv,ngvm
+    1 format('   setvert3d:',i4,4i16)
+
+      return
+      end
+c-----------------------------------------------------------------------
+
+
+c-----------------------------------------------------------------------
+      subroutine setvert3d_legacy(glo_num,ngv,nx,nel,vertex,ifcenter)
 c
 c     setup unique ids for dssum
 c     note:
@@ -643,7 +1091,7 @@ c     Quick check on maximum #dofs:
       return
       end
 c-----------------------------------------------------------------------
-      subroutine setvert2d(glo_num,ngv,nx,nel,vertex,ifcenter)
+      subroutine setvert2d_legacy(glo_num,ngv,nx,nel,vertex,ifcenter)
 c
 c     setup unique ids for dssum
 c
@@ -862,8 +1310,189 @@ c
 
       return
       end
+
+
+c-----------------------------------------------------------------------
+      subroutine setvert2d(glo_num,ngv,nx,nel,vertex,ifcenter)
+c
+c     setup unique ids for dssum  
+c
+      include 'SIZE'
+      include 'CTIMER'
+      include 'PARALLEL'
+      include 'TOPOL'
+      include 'GEOM'
+
+      integer*8 glo_num(1)
+      integer*8 ngv
+      integer*8 vertex(0:1,0:1,1)
+      logical ifcenter
+
+      integer*8  edge(0:1,0:1,2,lelt),enum(4,lelt)
+      common  /scrmg/ edge,enum
+
+      parameter (nsafe=8)  ! OFTEN, nsafe=2 suffices
+      integer*8 etuple(4,4*lelt*nsafe)
+      integer   ind(4*lelt*nsafe)
+      common  /scrns/ etuple,ind
+
+      integer e,eg
+      logical ifij
+
+      integer*8 ngvv,ngve,ngvs,ngvi,ngvm,igv,ig0
+      integer*8 n_on_edge,n_on_face,n_in_interior,n_unique_edges
+      integer*8 i8glmax,kswap
+
+c     memory check...
+
+      ny   = nx
+      nz   = 1
+      nxyz = nx*ny*nz
+
+c     Count number of unique vertices
+      nlv  = 2**ldim
+      ngvv = i8glmax(vertex,nlv*nel)
+      ngv  = ngvv
+
+
+c     Assign hypercube ordering of vertices.
+      do e=1,nel
+         do j=0,1
+         do i=0,1
+c           Local to global node number (vertex)
+            il  = 1 + (nx-1)*i + nx*(nx-1)*j
+            ile = il + nx*ny*(e-1)
+            glo_num(ile)   = vertex(i,j,e)
+         enddo
+         enddo
+      enddo
+      if (nx.eq.2) return
+c
+c     Assign edge labels by bounding vertices.  
+      do e=1,nel
+         do j=0,1
+         do i=0,1
+            edge(i,j,1,e) = vertex(i,j,e)  ! r-edge
+            edge(j,i,2,e) = vertex(i,j,e)  ! s-edge
+         enddo
+         enddo
+      enddo
+
+c     Sort edges by bounding vertices.
+      do i=0,4*nel-1
+         if (edge(0,i,1,1).gt.edge(1,i,1,1)) then
+            kswap = edge(0,i,1,1)
+            edge(0,i,1,1) = edge(1,i,1,1)
+            edge(1,i,1,1) = kswap
+         endif
+         etuple(3,i+1) = edge(0,i,1,1)
+         etuple(4,i+1) = edge(1,i,1,1)
+      enddo
+
+c     Assign a number (rank) to each unique edge
+      m    = 4
+      n    = 4*nel
+      nmax = 4*lelt*nsafe  ! nsafe for crystal router factor of safety
+
+      call gbtuple_rank8(etuple,m,n,nmax,cr_h,nid,np,ind)
+
+      do i=1,4*nel
+         enum(i,1) = etuple(3,i)
+      enddo
+      n_unique_edges = iglmax(enum,4*nel)
+
+c= = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+c     Assign global vertex numbers to SEM nodes on each edge
+      n_on_edge = nx-2
+      do e=1,nel
+
+         iedg_loc = 0
+
+c        Edges 1-2
+         do j=0,1
+            igv = ngv + n_on_edge*(enum(iedg_loc+1,e)-1)
+            i0  = nx*(nx-1)*j
+            i0e = i0 + nxyz*(e-1)
+            if (glo_num(i0e+1).lt.glo_num(i0e+nx)) then
+               do i=2,nx-1                                   ! std forward case
+                  glo_num(i0e+i) = igv + i-1
+               enddo
+            else
+               do i=2,nx-1                                   ! backward case
+                  glo_num(i0e+i) = igv + 1 + n_on_edge-(i-1)
+               enddo
+            endif
+            iedg_loc = iedg_loc + 1
+         enddo
+c
+c        Edges 3-4
+         do i=0,1
+            igv = ngv + n_on_edge*(enum(iedg_loc+1,e)-1)
+            i0  = 1+(nx-1)*i
+            i0e = i0 + nxyz*(e-1)
+            if (glo_num(i0e).lt.glo_num(i0e+nx*(nx-1))) then
+               do j=2,nx-1                                   ! std forward case
+                  glo_num(i0e+(j-1)*nx) = igv + j-1
+               enddo
+            else
+               do j=2,nx-1                                   ! backward case
+                  glo_num(i0e+(j-1)*nx) = igv + 1 + n_on_edge-(j-1)
+               enddo
+            endif
+            iedg_loc = iedg_loc + 1
+         enddo
+      enddo
+ 
+      ngve = n_unique_edges*n_on_edge
+      ngv  = ngv + ngve    
+c
+c     Finally,  number interiors  
+c
+      n_in_interior = (nx-2)*(ny-2)
+      ngvi          = n_in_interior*nelgt
+      if (ifcenter) then
+         do e=1,nel
+            ig0 = ngv + n_in_interior*(lglel(e)-1)
+            l = 0
+            do j=2,ny-1
+            do i=2,nx-1
+               l = l+1
+               glo_num(i+nx*(j-1)+nxyz*(e-1)) = ig0+l
+            enddo
+            enddo
+         enddo
+         ngv = ngv + ngvi
+      else
+         do e=1,nel
+            l = 0
+            do j=2,ny-1
+            do i=2,nx-1
+               l = l+1
+               glo_num(i+nx*(j-1)+nxyz*(e-1)) = 0
+            enddo
+            enddo
+         enddo
+      endif
+
+c     Quick check on maximum #dofs:
+      m    = nxyz*nelt
+      ngvm = i8glmax(glo_num,m)
+      ngvv = ngvv + ngve         ! number of unique ids w/o interior 
+      ngvi = ngvi + ngvv         ! total number of unique ids 
+      if (nio.eq.0) write(6,1) nx,ngvv,ngvi,ngv,ngvm
+    1 format('   setvert2d:',i4,4i12)
+
+      return
+      end
+
+
+
 c-----------------------------------------------------------------------
       subroutine get_vert
+#if !defined(PARRSB) && !defined(PARMETIS)
+# if defined(DPROCMAP)
+      call exitti('DPROCMAP requires PARRSB or PARMETIS!$',0)
+# else
       include 'SIZE'
       include 'TOTAL'
       include 'ZPER'
@@ -887,9 +1516,844 @@ c-----------------------------------------------------------------------
       call get_vert_map(vertex, ncrnr, nelgt, '.map',ifgfdm)
 
       return
+# endif
+#else
+      include 'SIZE'
+      include 'TOTAL'
+
+      integer icalld
+      save    icalld
+      data    icalld  /0/
+
+      if(icalld.gt.0) return
+
+      nv = 2**ldim
+      if (nid_io.eq.0) write(6,*) 'Call get_vert_map_con (with .co2)'
+      call get_vert_map_con(nv)
+
+      icalld = 1
+
+      return
+#endif
+      end
+
+
+
+#if defined(PARRSB) || defined(PARMETIS)
+c-----------------------------------------------------------------------
+      subroutine get_vert_map_con(nlv)
+
+      include 'SIZE'
+      include 'TOTAL'
+
+      parameter(mdw=2+2**ldim)
+      parameter(ndw=7*lx1*ly1*lz1*lelv/mdw)
+      common /scrns/ wk(mdw*ndw)
+      integer*8 wk
+
+      integer     wk4(2*mdw*ndw)
+      equivalence (wk4,wk)
+
+      common /ivrtx/ vertex ((2**ldim),lelt)
+      integer*8 vertex
+
+      common /nekmpi/ mid,mp,nekcomm,nekgroup,nekreal
+
+      integer ibuf(2)
+
+      integer*8 eid8(lelt), vtx8(lelt*2**ldim)
+      integer   iwork(lelt)
+      common /ctmp0/ eid8, vtx8, iwork
+
+      common /scrcg/ xyz(ldim*lelt*2**ldim)
+
+      integer cnt, algo
+      integer opt_parrsb(3), opt_parmetis(10)
+
+      logical ifbswap, ifread_con
+
+      neli = nelt
+      ifread_con = .true.
+      if(nid.eq.0) write(6,*) ' Calling read_con'
+      call read_con(wk4,size(wk),neli,nlv,ierr)
+
+      if (ierr.ne.0) then
+        ifread_con = .false.
+        if(nid.eq.0) write(6,*) ' Calling find_cond'
+        call find_con(wk,nwk,0.2,ierr)
+        if(ierr.ne.0) call find_con(wk,nwk,0.01,ierr)
+        call err_chk(ierr,' findConnectivity failed!$')
+      endif
+
+c fluid elements
+      if(nid.eq.0) write(6,*) ' Fluid elements'
+      j  = 0
+      ii = 0
+      cnt= 0
+      do i = 1,neli
+         itmp = wk(ii+1)
+         if (ifread_con) itmp = wk4(ii+1)
+
+         if (itmp .le. nelgv) then
+            j = j + 1
+
+            eid8(j) = wk(ii+1)
+            call i8copy(vtx8((j-1)*nlv+1),wk(ii+2),nlv)
+            if (ifread_con) then
+              eid8(j) = wk4(ii+1)
+              call icopy48(vtx8((j-1)*nlv+1),wk4(ii+2),nlv)
+            endif
+
+            do iv=1,nlv
+              xyz(cnt+1)=xc(iv,i)
+              xyz(cnt+2)=yc(iv,i)
+              if(ldim.eq.3) then
+                xyz(cnt+3)=zc(iv,i)
+                cnt=cnt+3
+              else
+                cnt=cnt+2
+              endif
+            enddo
+         endif
+         ii = ii + (nlv+1)
+      enddo
+      neliv = j
+
+      algo = 0 ! 0 - Lanczos, 1 - MG
+      nel = neliv
+      if(nid.eq.0) write(6,*) ' Call fpartMesh'
+      call fpartMesh(eid8,vtx8,xyz,lelt,nel,nlv,nekcomm,
+     $  meshPartitioner,algo,loglevel,ierr)
+      call err_chk(ierr,'partMesh fluid failed!$')
+
+      nelv = nel
+      nelt = nelv
+      ierr = 0 
+      if (nelv .gt. lelv) ierr = 1
+      call err_chk(ierr,'nelv > lelv!$')
+ 
+      if(nid.eq.0) write(6,*) ' Call lglel(i)=eid8(i)'
+      do i = 1,nelv
+         lglel(i) = eid8(i)
+      enddo
+      if(nid.eq.0) write(6,*) ' Call isort'
+      call isort(lglel,iwork,nelv)
+      do i = 1,nelv
+         call i8copy(vertex(1,i),vtx8((iwork(i)-1)*nlv+1),nlv)
+      enddo
+
+      cnt=0
+c solid elements
+      if (nelgt.ne.nelgv) then
+         j  = 0
+         ii = 0
+         do i = 1,neli
+            itmp = wk(ii+1)
+            if (ifread_con) itmp = wk4(ii+1)
+
+            if (itmp .gt. nelgv) then
+               j = j + 1
+
+               eid8(j) = wk(ii+1)
+               call i8copy(vtx8((j-1)*nlv+1),wk(ii+2),nlv)
+               if (ifread_con) then
+                 eid8(j) = wk4(ii+1)
+                 call icopy48(vtx8((j-1)*nlv+1),wk4(ii+2),nlv)
+               endif
+
+               do iv=1,nlv
+                 xyz(cnt+1)=xc(iv,i)
+                 xyz(cnt+2)=yc(iv,i)
+                 if(ldim.eq.3) then
+                   xyz(cnt+3)=zc(iv,i)
+                   cnt=cnt+3
+                 else
+                   cnt=cnt+2
+                 endif
+               enddo
+            endif
+            ii = ii + (nlv+1)
+         enddo
+         nelit = j
+
+         algo = 0 ! 0 - Lanczos, 1 - MG
+         nel = nelit
+         call fpartMesh(eid8,vtx8,xyz,lelt,nel,nlv,nekcomm,
+     $                  meshPartitioner,algo,loglevel,ierr)
+         call err_chk(ierr,'partMesh solid failed!$')
+
+         nelt = nelv + nel
+         ierr = 0 
+         if (nelt .gt. lelt) ierr = 1
+         call err_chk(ierr,'nelt > lelt!$')
+    
+         do i = 1,nel
+            lglel(nelv+i) = eid8(i)
+         enddo
+         call isort(lglel(nelv+1),iwork,nel) ! sort locally by global element id
+         do i = 1,nel
+            call i8copy(vertex(1,nelv+i),vtx8((iwork(i)-1)*nlv+1),nlv)
+         enddo
+      endif
+
+#ifdef DPROCMAP
+      do i = 1,nelt
+         ieg = lglel(i)
+         if (ieg.lt.1 .or. ieg.gt.nelgt) 
+     $      call exitti('invalid ieg!$',ieg)
+         ibuf(1) = i
+         ibuf(2) = nid
+         call dProcmapPut(ibuf,2,0,ieg)
+      enddo
+#else
+      call izero(gllnid,nelgt)
+      do i = 1,nelt
+         ieg = lglel(i)
+         gllnid(ieg) = nid
+      enddo
+      npass = 1 + nelgt/lelt
+      k=1
+      do ipass = 1,npass
+         m = nelgt - k + 1
+         m = min(m,lelt)
+         if (m.gt.0) call igop(gllnid(k),iwork,'+  ',m)
+         k = k+m
+      enddo
+#endif
+
+      return
       end
 c-----------------------------------------------------------------------
+#endif
+
+c-----------------------------------------------------------------------
       subroutine get_vert_map(vertex, nlv, nel, suffix, ifgfdm)
+
+      include 'SIZE'
+      include 'TOTAL'
+
+      logical ifma2,ifmap
+
+      parameter(mdw=2+2**ldim)
+      parameter(ndw=7*lx1*ly1*lz1*lelv/mdw)
+      common /scrns/ wk(mdw*ndw)
+      integer*8 wk
+
+      integer     wk4(2*mdw*ndw)
+      equivalence (wk4,wk)
+
+      common /nekmpi/ mid,mp,nekcomm,nekgroup,nekreal
+
+      integer ibuf(2)
+      integer*8 vertex((2**ldim),lelt)
+
+      integer*8 eid8(lelt), vtx8(lelt*2**ldim)
+      integer   iwork(lelt)
+      common /ctmp0/ eid8, vtx8, iwork
+
+      common /scrcg/ xyz(ldim*lelt*2**ldim)
+
+      integer cnt, algo
+      integer opt_parrsb(3), opt_parmetis(10)
+
+      logical ifbswap, ifread_con
+
+      ierr = 0
+      ifmap = .false.
+      ifma2 = .false.
+
+      if (nid.eq.0) then
+         inquire(file=mapfle, exist=ifmap)
+         inquire(file=ma2fle, exist=ifma2)
+        if(.not.ifmap .and. .not.ifma2) ierr = 1 
+      endif
+      call err_chk(ierr,' Cannot find map file!$')
+      call bcast(ifmap,lsize)
+      call bcast(ifma2,lsize)
+      ierr = 0
+
+#if !defined(PARRSB) && !defined(PARMETIS)
+# if defined(DPROCMAP)
+      call exitti('DPROCMAP requires PARRSB or PARMETIS!$',0)
+# else
+      if(nid.eq.0) write(6,*) ' get_vert_map using .map or .ma2'
+      if (ifmap) then
+         call read_map(vertex, nlv, nel, '.map', ifgfdm)
+      elseif (ifma2) then
+         call read_ma2(vertex, nlv, nel, '.ma2', ifgfdm)
+      endif
+      return
+# endif
+#else
+      if(nid.eq.0) write(6,*) ' get_vert_map using .co2'
+      neli = nelt
+      ifread_con = .true.
+      call read_con(wk4,size(wk),neli,nlv,ierr)
+
+      if (ierr.ne.0) then
+        ifread_con = .false.
+        call find_con(wk,nwk,0.2,ierr)
+        if(ierr.ne.0) call find_con(wk,nwk,0.01,ierr)
+        call err_chk(ierr,' findConnectivity failed!$')
+      endif
+
+c fluid elements
+      if(nid.eq.0) write(6,*) ' get_vert_map using .co2, fluid elements'
+      j  = 0
+      ii = 0
+      cnt= 0
+      do i = 1,neli
+         itmp = wk(ii+1)
+         if (ifread_con) itmp = wk4(ii+1)
+
+         if (itmp .le. nelgv) then
+            j = j + 1
+
+            eid8(j) = wk(ii+1)
+            call i8copy(vtx8((j-1)*nlv+1),wk(ii+2),nlv)
+            if (ifread_con) then
+              eid8(j) = wk4(ii+1)
+              call icopy48(vtx8((j-1)*nlv+1),wk4(ii+2),nlv)
+            endif
+
+            do iv=1,nlv
+              xyz(cnt+1)=xc(iv,i)
+              xyz(cnt+2)=yc(iv,i)
+              if(ldim.eq.3) then
+                xyz(cnt+3)=zc(iv,i)
+                cnt=cnt+3
+              else
+                cnt=cnt+2
+              endif
+            enddo
+         endif
+         ii = ii + (nlv+1)
+      enddo
+      neliv = j
+
+      algo = 0 ! 0 - Lanczos, 1 - MG
+      nel = neliv
+      if(nid.eq.0) write(6,*) ' calling fpartMesh'
+      call fpartMesh(eid8,vtx8,xyz,lelt,nel,nlv,nekcomm,
+     $  meshPartitioner,algo,loglevel,ierr)
+      call err_chk(ierr,'partMesh fluid failed!$')
+
+      nelv = nel
+      nelt = nelv
+      ierr = 0 
+      if (nelv .gt. lelv) ierr = 1
+      call err_chk(ierr,'nelv > lelv!$')
+      if(nid.eq.0) write(6,*) ' nelv', nelv
+      if(nid.eq.0) write(6,*) ' nelt', nelt
+ 
+      do i = 1,nelv
+         if(nid.eq.0) write(6,*) ' lglel(i)=eid8(i)'
+         lglel(i) = eid8(i)
+      enddo
+      if(nid.eq.0) write(6,*) ' calling isort'
+      call isort(lglel,iwork,nelv)
+      do i = 1,nelv
+         if(nid.eq.0) write(6,*) ' calling i8copy'
+         if(nid.eq.0) write(6,*) vertex(1,i)
+         if(nid.eq.0) write(6,*) iwork(i)
+         if(nid.eq.0) write(6,*) vtx8((iwork(i)-1)*nlv+1)
+         call i8copy(vertex(1,i),vtx8((iwork(i)-1)*nlv+1),nlv)
+      enddo
+
+      cnt=0
+c solid elements
+      if(nid.eq.0) write(6,*) ' get_vert_map using .co2, solid elements'
+      if (nelgt.ne.nelgv) then
+         j  = 0
+         ii = 0
+         do i = 1,neli
+            itmp = wk(ii+1)
+            if (ifread_con) itmp = wk4(ii+1)
+
+            if (itmp .gt. nelgv) then
+               j = j + 1
+
+               eid8(j) = wk(ii+1)
+               call i8copy(vtx8((j-1)*nlv+1),wk(ii+2),nlv)
+               if (ifread_con) then
+                 eid8(j) = wk4(ii+1)
+                 call icopy48(vtx8((j-1)*nlv+1),wk4(ii+2),nlv)
+               endif
+
+               do iv=1,nlv
+                 xyz(cnt+1)=xc(iv,i)
+                 xyz(cnt+2)=yc(iv,i)
+                 if(ldim.eq.3) then
+                   xyz(cnt+3)=zc(iv,i)
+                   cnt=cnt+3
+                 else
+                   cnt=cnt+2
+                 endif
+               enddo
+            endif
+            ii = ii + (nlv+1)
+         enddo
+         nelit = j
+
+         algo = 0 ! 0 - Lanczos, 1 - MG
+         nel = nelit
+         if(nid.eq.0) write(6,*) ' calling fpartMesh'
+         call fpartMesh(eid8,vtx8,xyz,lelt,nel,nlv,nekcomm,
+     $                  meshPartitioner,algo,loglevel,ierr)
+         call err_chk(ierr,'partMesh solid failed!$')
+
+         nelt = nelv + nel
+         ierr = 0 
+         if (nelt .gt. lelt) ierr = 1
+         call err_chk(ierr,'nelt > lelt!$')
+    
+         do i = 1,nel
+            lglel(nelv+i) = eid8(i)
+         enddo
+         call isort(lglel(nelv+1),iwork,nel) ! sort locally by global element id
+         do i = 1,nel
+            call i8copy(vertex(1,nelv+i),vtx8((iwork(i)-1)*nlv+1),nlv)
+         enddo
+      endif
+
+#ifdef DPROCMAP
+      do i = 1,nelt
+         ieg = lglel(i)
+         if (ieg.lt.1 .or. ieg.gt.nelgt) 
+     $      call exitti('invalid ieg!$',ieg)
+         ibuf(1) = i
+         ibuf(2) = nid
+         call dProcmapPut(ibuf,2,0,ieg)
+      enddo
+#else
+      call izero(gllnid,nelgt)
+      do i = 1,nelt
+         ieg = lglel(i)
+         gllnid(ieg) = nid
+      enddo
+      npass = 1 + nelgt/lelt
+      k=1
+      do ipass = 1,npass
+         m = nelgt - k + 1
+         m = min(m,lelt)
+         if (m.gt.0) call igop(gllnid(k),iwork,'+  ',m)
+         k = k+m
+      enddo
+#endif
+
+
+#endif
+      end
+
+c-----------------------------------------------------------------------
+      subroutine read_ma2(vertex, nlv, nel, suffix, ifgfdm)
+      include 'SIZE'
+      include 'INPUT'
+      include 'PARALLEL'
+      logical ifgfdm
+      common /nekmpi/ nid_,np_,nekcomm,nekgroup,nekreal
+      integer vertex(nlv,1)
+      character*4 suffix
+
+      parameter(mdw=2+2**ldim)
+      parameter(ndw=7*lx1*ly1*lz1*lelv/mdw)
+      common /scrns/ wk(mdw,ndw)   ! room for long ints, if desired
+      integer wk,e,eg,eg0,eg1
+      integer neli,nnzi
+      integer iok,ierr
+      integer ma2_h
+      integer*8 lma2off_b,count_b
+
+      character*132 hdr
+      character*5   version
+      real*4        test
+      integer       itmp20(20)
+      logical ifbswap,if_byte_swap_test
+      
+      ierr = 0
+      iok = 0
+      call izero(wk,size(wk))
+      if (nid.eq.0) then
+         call byte_close(ierr)
+         call byte_open(ma2fle,ierr)
+         if(ierr.ne.0) goto 999
+
+         call blank(hdr,132)
+         call byte_read(hdr,132/4,iok)
+         if(ierr.ne.0) goto 999
+
+         read (hdr,1) version,neli,nnzi
+         write(6,*) ' version,neli,nnzi:', version,neli,nnzi
+    1    format(a5,2i12)
+
+         call byte_read(test,1,ierr)
+         if(ierr.ne.0) goto 999
+         ifbswap = if_byte_swap_test(test,ierr)
+         if(ierr.ne.0) goto 999
+         call byte_close(ierr)
+
+         if (nid.eq.0) write(6,*) ' Finish reading ma2 header'
+         if (ierr.eq.0) then
+            iok = 1
+         endif
+      endif
+
+   99 continue
+      iok = iglmax(iok,1)
+      if(nid.eq.0) write(6,'(A,A)') ' Reading ', ma2fle
+      if (iok.eq.0) goto 999     ! Mapfile not found
+
+      if (nid.eq.0) then
+         neli = iglmax(neli,1)   ! communicate to all procs
+      else
+         neli = 0
+         neli = iglmax(neli,1)   ! communicate neli to all procs
+      endif
+
+      npass = 1 + (neli/ndw)
+
+      if (npass.gt.np) then
+         if (nid.eq.0) write(6,*) npass,np,neli,ndw,'Error get_vert_map'
+         call exitt(1)
+      endif
+
+      len = 4*mdw*ndw
+      if (nid.gt.0.and.nid.lt.npass) msg_id=irecv(nid,wk,len)
+      call nekgsync
+      
+      call nek_file_open(nekcomm,ma2fle,0,0,param(61),ma2_h,iok)
+      lma2off_b = 136
+      if (nid.eq.0) then
+         eg0 = 0
+         do ipass=1,npass
+            eg1 = min(eg0+ndw,neli)
+            nwds = (eg1 - eg0)*(mdw-1)
+            count_b = int(nwds,8)*4
+            call nek_file_read(ma2_h,count_b,lma2off_b,wk,iok)
+            lma2off_b = lma2off_b+count_b
+            if (iok.ne.0) goto 200
+            if (ifbswap) call byte_reverse(wk,nwds,iok)
+
+            m = eg1 - eg0
+            do eg=eg1,eg0+1,-1 ! reshuffle array
+               jj = (m-1)*(mdw-1) + 1
+               call icopy(itmp20,wk(jj,1),mdw-1)
+               call icopy(wk(1,m),itmp20 ,mdw-1)
+               m = m - 1
+               if (.not.ifgfdm) gllnid(eg) = wk(1,m)
+            enddo
+
+            m = 0
+            do eg=eg0+1,eg1
+               m = m+1
+               do i = mdw,2,-1
+                  wk(i,m) = wk(i-1,m)
+               enddo
+               wk(1,m) = eg
+            enddo
+
+            if (ipass.lt.npass) call csend(ipass,wk,len,ipass,0) !send to ipass
+            eg0 = eg1
+         enddo
+c         close(80)
+c         call byte_close(iok)
+         ntuple = m
+      else
+         eg = 0
+         do ipass=1,npass
+            eg1 = min(eg0+ndw,neli)
+            nwds = (eg1 - eg0)*(mdw-1)
+            count_b = 0
+            call nek_file_read(ma2_h,count_b,lma2off_b,wk,iok)
+            lma2off_b = lma2off_b+int(nwds,8)*4
+         enddo
+         if (nid.lt.npass) then
+            call msgwait(msg_id)
+            ntuple = ndw
+         else
+            ntuple = 0
+         endif
+      endif
+      call nek_file_close(ma2_h,ierr)
+
+c     Distribute and assign partitions
+
+      if (nid_io.eq.0) write(6,*) 'ifgfdm',ifgfdm
+      if (.not.ifgfdm) then
+      lng = isize*neli
+      call bcast(gllnid,lng)
+      call assign_gllnid(gllnid,gllel,nelgt,nelgv,np) ! gllel is used as scratch
+      endif
+
+c      if(nid.eq.0) then
+c         write(99,*) (gllnid(i),i=1,nelgt)
+c         write( 6,*) (gllnid(i),i=1,nelgt)
+C      endif
+
+      nelt=0 !     Count number of elements on this processor
+      nelv=0
+      do eg=1,neli
+         if (gllnid(eg).eq.nid) then
+            if (eg.le.nelgv) nelv=nelv+1
+            if (eg.le.nelgt) nelt=nelt+1
+         endif
+      enddo
+      if (np.le.64) then 
+          if (nid_io.eq.0) write(6,33) nid,nelv,nelt,nelgv,nelgt
+      endif
+  33  format(5i12,' NELV')
+
+c     now: crystal route vertex by processor id
+      do i=1,ntuple
+         eg=wk(1,i)
+         wk(2,i)=gllnid(eg)        ! processor id for element eg
+      !  write(6,*) 'ntuple',nid,ntuple,i,eg,gllnid(eg),ndim
+      enddo
+
+      key = 2 ! processor id is in wk(2,:)
+      call crystal_ituple_transfer(cr_h,wk,mdw,ntuple,ndw,key)
+
+      if (.not.ifgfdm) then            ! no sorting for gfdm?
+         key = 1  ! Sort tuple list by eg := wk(1,:)
+         nkey= 1
+         call crystal_ituple_sort(cr_h,wk,mdw,nelt,key,nkey)
+      endif
+
+      iflag = 0
+      if (ntuple.ne.nelt) then
+         write(6,*) nid,ntuple,nelv,nelt,nelgt,' NELT FAIL'
+         iflag=1
+      else
+         nv = 2**ndim
+         do e=1,nelt
+            call icopy(vertex(1,e),wk(3,e),nv)
+         enddo
+      endif
+
+      iflag = iglmax(iflag,1)
+      if (iflag.gt.0) then
+         do mid=0,np-1
+            call nekgsync
+            if (mid.eq.nid)
+     $      write(6,*) nid,ntuple,nelv,nelt,nelgt,' NELT FB'
+            call nekgsync
+         enddo
+         call nekgsync
+         call exitt(1)
+      endif
+      return
+
+  999 continue
+      if (nid.eq.0) write(6,*) 'ABORT: Could not find ma2 file ',ma2fle
+      call exitt(1)
+
+  998 continue
+      if (nid.eq.0) write(6,*)ipass,npass,eg0,eg1,mdw,m,eg,'get vX fail'
+      call exitt(1)
+ 
+  200 continue
+      call err_chk(iok,'Error while reading map file$')
+
+      return
+
+      end
+
+c-----------------------------------------------------------------------
+      subroutine read_con(wk,nwk,nelr,nv,ierr)
+
+      include 'SIZE'
+      include 'INPUT'
+      include 'PARALLEL'
+
+      integer nwk,nelr,nv,ierr
+      integer wk(nwk)
+
+      logical ifbswap,if_byte_swap_test
+      logical ifco2, ifcon
+
+      character*132 confle
+      character*1   confle1(132)
+      equivalence  (confle,confle1)
+
+      character*132 hdr
+      character*5   version
+      real*4        test
+
+      integer nvi
+      integer*8 nelgti,nelgvi
+      integer*8 offs, offs0
+      integer*8 count_b
+      integer co2_h
+
+      common /nekmpi/ mid,mp,nekcomm,nekgroup,nekreal
+
+      ierr = 0
+
+      ifco2 = .false.
+      ifmpiio = .true.
+#ifdef NOMPIIO
+      ifmpiio = .false.
+#endif
+
+      if (nid.eq.0) then
+         lfname = ltrunc(reafle,132) - 4
+         call blank (confle,132)
+         call chcopy(confle,reafle,lfname)
+         call chcopy(confle1(lfname+1),'.con',4)
+         inquire(file=confle, exist=ifcon)
+
+         if (.not.ifcon) then
+            call chcopy(confle1(lfname+1),'.co2',4)
+            inquire(file=confle, exist=ifco2)
+         endif
+
+        if(.not.ifcon .and. .not.ifco2) ierr = 1
+      endif
+
+      call bcast(ierr,sizeof(ierr))
+      if(ierr.ne.0) return
+
+      call bcast(confle,sizeof(confle))
+      if(nid.eq.0) write(6,'(A,A)') ' Reading ', confle
+      call bcast(ifco2,lsize)
+
+      ierr = 0
+
+      ! read header
+      if (nid.eq.0) then
+         if (ifco2) then
+            call byte_open(confle,ierr)
+            if(ierr.ne.0) goto 100
+
+            call blank(hdr,sizeof(hdr))
+            call byte_read(hdr,sizeof(hdr)/4,ierr)
+            if(ierr.ne.0) goto 100
+
+            read (hdr,*) version,nelgti,nelgvi,nvi
+c    1       format(a5,2i12,i2)
+
+            call byte_read(test,1,ierr)
+            if(ierr.ne.0) goto 100
+            ifbswap = if_byte_swap_test(test,ierr)
+            if(ierr.ne.0) goto 100
+         endif
+      endif
+      call bcast(nelgti,sizeof(nelgti))
+      call bcast(nelgvi,sizeof(nelgvi))
+      call bcast(nvi,sizeof(nvi))
+      call bcast(ifbswap,sizeof(ifbswap))
+
+      if (nvi .ne. nv)
+     $   call exitti('Number of vertices do not match!$',0)
+      if (nelgti .ne. nelgt)
+     $   call exitti('nelgt for mesh/con differs!$',0)
+      if (nelgvi .ne. nelgv)
+     $   call exitti('nelgt for mesh/con differs!$',0)
+
+      if (ifco2) then
+        if (nid.eq.0) call byte_close(ierr)
+        call nek_file_open(nekcomm,confle,0,0,param(61),co2_h,ierr)
+        offs0 = sizeof(hdr) + sizeof(test)
+
+        call lim_chk(nelr*(nvi+1),nwk,'nelr ','nwk   ','read_con  ')
+
+        nelBr = igl_running_sum(nelr) - nelr
+        offs  = offs0 + int(nelBr,8)*(nvi+1)*ISIZE
+
+        count_b = int((nvi+1)*nelr,8)*4
+        call nek_file_read(co2_h,count_b,offs,wk,ierr)
+        call err_chk(ierr,' Error while reading con file!$')
+        call nek_file_close(co2_h,ierr)
+        if (ifbswap) call byte_reverse(wk,(nvi+1)*nelr,ierr)
+      endif
+
+      return
+
+
+ 100  continue
+      call err_chk(ierr,'Error opening/reading con file$')
+      return
+
+      end
+c-----------------------------------------------------------------------
+#if defined(PARRSB)      
+      subroutine find_con(wk,nwk,tol,ierr)
+
+      include 'SIZE'
+      include 'INPUT'
+      include 'PARALLEL'
+
+      integer nwk,ierr
+      integer*8 wk(nwk)
+
+      common /nekmpi/ mid,mp,nekcomm,nekgroup,nekreal
+      common /scrcg/ xyz(ldim*(2**ldim)*lelt)
+
+      integer*8 eid8(4*lelt),vtx8(lelt*(2**ldim+1))
+      common /ctmp0/ eid8, vtx8, iwork
+
+      ierr = 0
+
+      nv=2**ndim
+      nf=2*ndim
+
+      k=0
+      if(ndim.eq.3) then
+        do i=1,nelt
+          do j=1,nv
+            xyz(k+1)=xc(j,i)
+            xyz(k+2)=yc(j,i)
+            xyz(k+3)=zc(j,i)
+            k=k+3
+          enddo
+        enddo
+      else
+        do i=1,nelt
+          do j=1,nv
+            xyz(k+1)=xc(j,i)
+            xyz(k+2)=yc(j,i)
+            k=k+2
+          enddo
+        enddo
+      endif
+
+      istart=igl_running_sum(nelt)-nelt
+
+      !calculate number of periodic pairs
+      npf=0
+      do i=1,nelt
+        do j=1,nf
+          if(cbc(j,i,1).eq.'P  ') then
+            eid8(4*npf+1)=i+istart
+            eid8(4*npf+2)=j
+            eid8(4*npf+3)=bc(1,j,i,1)
+            eid8(4*npf+4)=bc(2,j,i,1)
+            npf=npf+1
+          endif
+        enddo
+      enddo
+
+      call fparrsb_findConnectivity(vtx8,xyz,nelt,ndim,
+     $  eid8,npf,tol,nekcomm,0,ierr)
+
+      k=1
+      l=1
+      do i=1,nelt
+        wk(k)=istart+i
+        k=k+1
+        do j=1,nv 
+          wk(k)=vtx8(l)
+          k=k+1
+          l=l+1
+        enddo
+      enddo
+
+      end
+#endif
+
+
+c-----------------------------------------------------------------------
+      subroutine read_map(vertex, nlv, nel, suffix, ifgfdm)
       include 'SIZE'
       include 'INPUT'
       include 'PARALLEL'
@@ -903,22 +2367,16 @@ c-----------------------------------------------------------------------
       common /scrns/ wk(mdw,ndw)   ! room for long ints, if desired
       integer wk,e,eg,eg0,eg1
 
-      character*132 mapfle
-      character*1   mapfle1(132)
-      equivalence  (mapfle,mapfle1)
-
       iok = 0
       if (nid.eq.0) then
          lfname = ltrunc(reafle,132) - 4
-         call blank (mapfle,132)
-         call chcopy(mapfle,reafle,lfname)
-         call chcopy(mapfle1(lfname+1),suffix,4)
          open(unit=80,file=mapfle,status='old',err=99)
          read(80,*,err=99) neli,nnzi
          iok = 1
       endif
    99 continue
       iok = iglmax(iok,1)
+      if(nid.eq.0) write(6,'(A,A)') ' Reading ', mapfle
       if (iok.eq.0) goto 999     ! Mapfile not found
 
       if (nid.eq.0) then
@@ -1039,9 +2497,15 @@ c     now: crystal route vertex by processor id
   998 continue
       if (nid.eq.0) write(6,*)ipass,npass,eg0,eg1,mdw,m,eg,'get vX fail'
       call exitt(1)
-
+      
       return
+
+
       end
+c-----------------------------------------------------------------------
+
+
+
 c-----------------------------------------------------------------------
       subroutine initds
 C
@@ -2407,13 +3871,13 @@ c-----------------------------------------------------------------------
       integer vertex(nlv,nel)
       character*4 suffix
 c
-      character*132 mapfle
-      character*1   mapfle1(132)
-      equivalence  (mapfle,mapfle1)
+c      character*132 mapfle
+c      character*1   mapfle1(132)
+c      equivalence  (mapfle,mapfle1)
 c
-      lfname = ltrunc(reafle,132) - 4
-      call chcopy(mapfle,reafle,lfname)
-      call chcopy(mapfle1(lfname+1),suffix,4)
+c      lfname = ltrunc(reafle,132) - 4
+c      call chcopy(mapfle,reafle,lfname)
+c      call chcopy(mapfle1(lfname+1),suffix,4)
 c
       write(6,*) 'lfname:',lfname
       write(6,*) 'suffix:',suffix
@@ -2562,14 +4026,6 @@ c  where i = np-mod(nelgt,np) ... np
 
       return
       end
-c-----------------------------------------------------------------------
-      subroutine usrsetvert(glo_num,nel,nx,ny,nz) ! to modify glo_num
-      integer*8 glo_num(1)
-      return
-      end
-
-c-----------------------------------------------------------------------
-
 
 C=======================================================================
 
@@ -2788,3 +4244,58 @@ c
       end
 
 #endif
+
+c-----------------------------------------------------------------------
+
+      subroutine i8rank(a,ind,n)
+
+c     Use Heap Sort (p 233 Num. Rec.), 5/26/93 pff.
+
+      integer*8 a(1),q
+      integer ind(1)
+
+      if (n.le.1) return
+      do 10 J=1,N
+         IND(j)=j
+   10 continue
+C
+      if (n.eq.1) return
+      L=n/2+1
+      ir=n
+  100 continue
+         IF (l.gt.1) THEN
+            l=l-1
+            indx=ind(l)
+            q=a(indx)
+         ELSE
+            indx=ind(ir)
+            q=a(indx)
+            ind(ir)=ind(1)
+            ir=ir-1
+            if (ir.eq.1) then
+               ind(1)=indx
+               return
+            endif
+         ENDIF
+         i=l
+         j=l+l
+  200    continue
+         if (j.LE.ir) then
+            if (j.LT.ir) then
+               if ( a(ind(J)).LT.a(ind(J+1)) ) J=J+1
+            endif
+            if (q.lt.a(ind(J))) then
+               ind(i)=ind(j)
+               i=j
+               j=j+j
+            else
+               j=ir+1
+            endif
+         goto 200
+         endif
+         ind(i)=indx
+      goto 100
+      end
+c-----------------------------------------------------------------------
+
+

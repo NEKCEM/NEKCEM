@@ -33,6 +33,10 @@ c     real*8 dclock
       real eps
       integer igeom
 
+      integer*8 itest8
+
+      logical ifco2
+
       ! set word size for REAL
       eps = 1.0e-12
       if (1.0 + eps .ne. 1.0) then
@@ -42,6 +46,8 @@ c     real*8 dclock
       endif
       ! set word size for INTEGER
       isize = 4
+      ! set word size for INTEGER*8
+      isize8 = sizeof(itest8)
       ! set word size for LOGICAL
       lsize = 4
       ! set word size for CHARACTER
@@ -725,7 +731,7 @@ c     Set default logicals
       ifflow = .false.
       ifmvbd = .false.
       ifheat = .false.
-      ifsplit = .false.
+      ifsplit = .true.
       ifdoit = .false.
       iftet = .false.
       ifhex = .false.
@@ -832,7 +838,7 @@ C------------------------------------------------------------------------
       integer ierr
 
       character ostring(132)
-      character(10) s10
+      character(30) s10
       integer iglsum,indx1,k,len
 
       ierr = iglsum(ierr,1)
@@ -1068,17 +1074,20 @@ C
       EQUIVALENCE  (PATH,PATH1)
       EQUIVALENCE  (NAME,NAM1)
       CHARACTER*1  DMP(4),FLD(4),REA(4),HIS(4),SCH(4) ,ORE(4), NRE(4)
-      CHARACTER*1  RE2(4),PAR(4)
+      CHARACTER*1  RE2(4),PAR(4),MA2(4),CO2(4),MAP(4)
       CHARACTER*4  DMP4  ,FLD4  ,REA4  ,HIS4  ,SCH4   ,ORE4  , NRE4
-      CHARACTER*4  RE24  ,PAR4
+      CHARACTER*4  RE24  ,PAR4  ,MA24  ,CO24  ,MAP4
       EQUIVALENCE (DMP,DMP4), (FLD,FLD4), (REA,REA4), (HIS,HIS4)
-     $          , (SCH,SCH4), (ORE,ORE4), (NRE,NRE4)
-     $          , (RE2,RE24), (PAR,PAR4)
+     $          , (SCH,SCH4), (ORE,ORE4), (NRE,NRE4), (MAP,MAP4)
+     $          , (RE2,RE24), (PAR,PAR4), (MA2,MA24), (CO2,CO24)
       DATA DMP4,FLD4,REA4 /'.dmp','.fld','.rea'/
       DATA HIS4,SCH4      /'.his','.sch'/
       DATA ORE4,NRE4      /'.ore','.nre'/
       DATA RE24           /'.re2'       /
       DATA PAR4           /'.par'       /
+      DATA MA24           /'.ma2'       /
+      DATA CO24           /'.co2'       /
+      DATA MAP4           /'.map'       /
       CHARACTER*78  STRING
 C
 C     Find out the session name:
@@ -1104,6 +1113,9 @@ c      call err_chk(ierr,' Cannot open SESSION.NAME!$')
       endif
 
       CALL BLANK(PARFLE,132)
+      CALL BLANK(MAPFLE,132)
+      CALL BLANK(MA2FLE,132)
+      CALL BLANK(CO2FLE,132)
       CALL BLANK(REAFLE,132)
       CALL BLANK(RE2FLE,132)
       CALL BLANK(FLDFLE,132)
@@ -1134,6 +1146,18 @@ c
 c .par file
       call chcopy(nam1  (l1),par , 4)
       call chcopy(parfle    ,nam1,ln)
+
+c .par file
+      call chcopy(nam1  (l1),map, 4)
+      call chcopy(mapfle    ,nam1,ln)
+
+c .ma2 file
+      call chcopy(nam1  (l1),ma2 , 4)
+      call chcopy(ma2fle    ,nam1,ln)
+
+c .co2 file
+      call chcopy(nam1  (l1),co2 , 4)
+      call chcopy(co2fle    ,nam1,ln)
 c
 c .re2 file
       call chcopy(nam1  (l1),re2 , 4)

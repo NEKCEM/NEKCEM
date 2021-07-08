@@ -334,12 +334,21 @@ c
       INCLUDE 'PARALLEL'
       INCLUDE 'ZPER'
 
-      logical ifbswap, ifre2
+      logical ifbswap, ifre2, parfound
       character*132 string
       real*8 etime_tmp
       integer idum(3*numsts+3)
 
       ierr = 0
+
+      ! check if new rea file version exists
+      if(nid.eq.0) inquire(file=parfle, exist=parfound)
+      call bcast(parfound,lsize)
+      if (parfound) then
+         if(nio.eq.0) write(6,'(A,A)') ' Reading ', parfle
+         call readat_par
+         return
+      endif  
 
 c     Test timer accuracy
       edif = 0.0
@@ -382,7 +391,10 @@ C     Read mesh info
       call bcast(h5mfle,132)
 
       ifre2 =.false.
-      if (nelgs.lt.0) ifre2 = .true.     ! use new .re2 reader
+      if (nelgs.lt.0) then 
+          write(6,*) '  Reading .re2'
+          ifre2 = .true.     ! use new .re2 reader
+      endif
 
       ifgtp =.false.
       if (ndim.lt.0)  ifgtp = .true.     ! domain is a global tensor product
@@ -403,7 +415,7 @@ C     Read mesh info
       if (nid_io.eq.0) write(6,*) 'gfdm/ifgtp/ifre2',ifgfdm,ifgtp,ifre2
 
       if (ifre2) then
-         call bin_rd1(ifbswap)  ! rank0 will read mesh data + distribute
+          call read_re2_data(ifbswap, .true., .true., .true.)
       else
          maxrd = 32             ! max # procs to read at once
          mread = (np-1)/maxrd+1 ! mod param
@@ -511,6 +523,9 @@ c     to remove it properly we'll have to change all the rea files.
          endif
          call exitt(1)
       ENDIF
+
+c     SET DEFAULT NUMBER OF AGGREGATOR TO 0 
+      param(61) = 0
 
       nelx   = abs(param(116))   ! check for global tensor-product structure
       nely   = abs(param(117))
@@ -1249,6 +1264,7 @@ C
          WRITE(6,1400)
  1400    FORMAT
      $   ('  Mesh consistency check failed.  EXITING in VRDSMSH.')
+         RETURN
       ENDIF
 C
       tmp(1)=ierr
@@ -1737,6 +1753,8 @@ c-----------------------------------------------------------------------
          m = indx2(re2fle,132,' ',1)-1
          call chcopy(fname,re2fle,m)
 
+c TODO: hardcoded byte_close
+         call byte_close(ierr)
          call byte_open(fname,ierr)
          if(ierr.ne.0) goto 100
          call byte_read(hdr,20,ierr)
